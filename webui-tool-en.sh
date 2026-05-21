@@ -1,12 +1,13 @@
 #!/bin/bash
 #===============================================================================
-# 🦌 webui-tool.sh — Universal Multi-tool for Open WebUI
+# 🦌 webui-tool.sh — Universal Multitool for Open WebUI
 #===============================================================================
 # Combines functions for building, deploying, checking changes, and resolving conflicts.
 #
 # Usage:
-#   ./webui-tool.sh deploy [main|dev] [pr:<num>] [--build-only]
+#   ./webui-tool.sh deploy [main|dev] [pr:<num>] [--build-only] [--no-upstream]
 #       Build and deploy (or build only with --build-only)
+#       Option --no-upstream: deploy current custom branch WITHOUT updating from upstream
 #
 #   ./webui-tool.sh check [main|dev]
 #       Check repository status, compare with upstream
@@ -49,7 +50,7 @@ log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
 log_cmd()  { echo -e "${CYAN}[CMD]${NC} $1"; }
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_err "Root privileges are required."
+        log_err "Root privileges required."
         log_info "Run: sudo $0 $*"
         exit 1
     fi
@@ -83,23 +84,36 @@ cmd_deploy() {
     local target_branch="main"
     local pr_number=""
     local build_only=false
+    local no_upstream=false
     for arg in "$@"; do
         case "$arg" in
             --build-only) build_only=true ;;
+            --no-upstream) no_upstream=true ;;
             pr:[0-9]*) pr_number="${arg#pr:}" ;;
             dev|main) target_branch="$arg" ;;
             *) log_err "Unknown argument: $arg"; show_help; exit 1 ;;
         esac
     done
+    # Validate combinations
+    if [ "$no_upstream" = true ] && [ -n "$pr_number" ]; then
+        log_err "Cannot use --no-upstream with PR!"
+        log_info "PR requires upstream update to apply patch."
+        exit 1
+    fi
     echo -e "${YELLOW}========================================${NC}"
     echo -e "${YELLOW}🚀 DEPLOY: Build and Install${NC}"
     echo -e "${YELLOW}========================================${NC}"
     local mode_desc="Mode: $target_branch"
     [ -n "$pr_number" ] && mode_desc="$mode_desc + PR #$pr_number"
     [ "$build_only" = true ] && mode_desc="$mode_desc (build only)"
+    [ "$no_upstream" = true ] && mode_desc="Mode: CUSTOM ONLY (--no-upstream)"
     log_info "$mode_desc"
-    # Prepare repository
-    setup_repo "$target_branch" "$pr_number"
+    # Repository preparation
+    if [ "$no_upstream" = true ]; then
+        setup_repo_no_upstream
+    else
+        setup_repo "$target_branch" "$pr_number"
+    fi
     # Build
     build_backend
     build_frontend
@@ -112,6 +126,28 @@ cmd_deploy() {
     fi
     echo ""
     log_ok "🎉 All operations completed successfully!"
+}
+setup_repo_no_upstream() {
+    ensure_webui_dir
+    cd "$WEBUI_DIR"
+    log_info "Working with current custom branch without upstream update..."
+    local current_branch=$(git branch --show-current)
+    if [ "$current_branch" != "$CUSTOM_BRANCH" ]; then
+        log_info "Switching to $CUSTOM_BRANCH..."
+        git checkout "$CUSTOM_BRANCH"
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        log_warn "Uncommitted changes detected in working directory!"
+        log_info "Changes will be used as-is. Recommended to commit before deploy."
+        echo ""
+        git status --short | sed 's/^/   /'
+        echo ""
+    else
+        log_ok "Working directory is clean."
+    fi
+    local last_commit=$(git log -1 --oneline)
+    log_info "Current commit: $last_commit"
+    log_ok "Ready. Will build current state of $CUSTOM_BRANCH."
 }
 setup_repo() {
     local target_branch="$1"
@@ -156,7 +192,7 @@ setup_repo() {
     git checkout "$CUSTOM_BRANCH"
     if [ "$stashed" = true ]; then
         git stash pop || {
-            log_err "Conflict while restoring stash!"
+            log_err "Conflict during stash restore!"
             exit 1
         }
     fi
@@ -183,7 +219,7 @@ apply_pr() {
     if curl -sSL "$patch_url" | git am -3; then
         log_ok "PR #$pr_num applied successfully."
     else
-        log_err "Error applying PR #$pr_num!"
+        log_err "Failed to apply PR #$pr_num!"
         echo "Resolve conflicts manually:"
         echo "  1. git status"
         echo "  2. Edit files"
@@ -213,7 +249,7 @@ build_frontend() {
     log_info "Building Frontend..."
     cd "$WEBUI_DIR"
     if [ ! -d "src" ]; then
-        log_warn "Folder src not found. Skipping frontend build."
+        log_warn "src folder not found. Skipping frontend build."
         return 0
     fi
     install_node
@@ -222,7 +258,7 @@ build_frontend() {
     npm run build
     cd ..
     if [ ! -d "build" ]; then
-        log_err "Frontend build did not create folder build!"
+        log_err "Frontend build did not create build folder!"
         exit 1
     fi
     log_ok "Frontend ready (build/)."
@@ -258,7 +294,7 @@ update_prod() {
                 rm -rf "$item"
             fi
         else
-            echo "  Keeping: $item"
+            echo "  Preserving: $item"
         fi
     done
     log_info "[3/5] Updating frontend..."
@@ -294,7 +330,7 @@ update_prod() {
     log_ok "=== DEPLOY COMPLETED SUCCESSFULLY ==="
 }
 #-------------------------------------------------------------------------------
-# 🔍 CHECK: Check Changes
+# 🔍 CHECK: Verify Changes
 #-------------------------------------------------------------------------------
 cmd_check() {
     local target_branch="${1:-main}"
@@ -305,13 +341,13 @@ cmd_check() {
         exit 1
     fi
     echo -e "${YELLOW}========================================${NC}"
-    echo -e "${YELLOW}🔍 CHECK: Status Check${NC}"
+    echo -e "${YELLOW}🔍 CHECK: Status Verification${NC}"
     echo -e "${YELLOW}========================================${NC}"
-    log_info "Updating remote info..."
+    log_info "Updating remote information..."
     git fetch upstream --quiet 2>/dev/null || git fetch upstream
     echo ""
     echo "📊 REPOSITORY STATUS REPORT"
-    echo "=================================="
+    echo "==========================="
     echo ""
     echo "📍 Current branch:"
     local current=$(git branch --show-current)
@@ -321,7 +357,7 @@ cmd_check() {
         echo "   ⚠️ $current (expected $CUSTOM_BRANCH)"
     fi
     echo ""
-    echo "📜 Latest commits in $CUSTOM_BRANCH:"
+    echo "📜 Recent commits in $CUSTOM_BRANCH:"
     git log --oneline -30 "$CUSTOM_BRANCH" | sed 's/^/   /'
     echo ""
     echo "🔄 Merge status with upstream/$target_branch:"
@@ -338,16 +374,16 @@ cmd_check() {
     echo "🔀 Differences between $CUSTOM_BRANCH and upstream/$target_branch:"
     local diff_stat=$(git diff --stat "upstream/$target_branch..$CUSTOM_BRANCH" 2>/dev/null || true)
     if [ -z "$diff_stat" ]; then
-        echo "   ℹ️ No differences. Code is identical to upstream/$target_branch."
+        echo "   ℹ️ No differences. Code identical to upstream/$target_branch."
     else
         echo "   Custom changes detected:"
         echo "$diff_stat" | sed 's/^/   /'
     fi
     echo ""
-    echo "📝 Changed files:"
+    echo "📝 Modified files:"
     local diff_files=$(git diff --name-only "upstream/$target_branch..$CUSTOM_BRANCH" 2>/dev/null || true)
     if [ -z "$diff_files" ]; then
-        echo "   (no changed files)"
+        echo "   (no modified files)"
     else
         echo "$diff_files" | sed 's/^/   • /'
     fi
@@ -355,7 +391,7 @@ cmd_check() {
     echo "🔧 Uncommitted changes:"
     local status=$(git status --porcelain 2>/dev/null || true)
     if [ -z "$status" ]; then
-        echo "   ✅ Working directory is clean."
+        echo "   ✅ Working directory clean."
     else
         echo "   Changes detected:"
         echo "$status" | sed 's/^/   /'
@@ -364,8 +400,9 @@ cmd_check() {
     log_ok "Check completed!"
     echo ""
     echo "💡 Tips:"
-    echo "   • Change details: git diff upstream/$target_branch..$CUSTOM_BRANCH -- <file>"
+    echo "   • Details: git diff upstream/$target_branch..$CUSTOM_BRANCH -- <file>"
     echo "   • Update: $0 deploy $target_branch"
+    echo "   • Deploy without update: $0 deploy --no-upstream"
 }
 #-------------------------------------------------------------------------------
 # ⚡ ACCEPT-UPSTREAM: Accept All Changes
@@ -402,18 +439,23 @@ cmd_accept_upstream() {
 #-------------------------------------------------------------------------------
 show_help() {
     cat << EOF
-🦌 webui-tool.sh — Universal Multi-tool for Open WebUI
+🦌 webui-tool.sh — Universal Multitool for Open WebUI
 Usage:
   $0 <command> [arguments]
 Commands:
-  deploy [main|dev] [pr:<num>] [--build-only]
-      Build and deploy the project.
+  deploy [main|dev] [pr:<num>] [--build-only] [--no-upstream]
+      Build and deploy project.
+      Options:
+        --build-only    Build only, no deploy
+        --no-upstream   Deploy current custom branch WITHOUT upstream update
+                        (preserves all local changes, no fetch/merge)
       Examples:
         $0 deploy                    # Build from main + deploy
         $0 deploy dev                # Build from dev + deploy
         $0 deploy pr:1234            # Build main + PR #1234 + deploy
         $0 deploy dev pr:1234        # Build dev + PR #1234 + deploy
         $0 deploy --build-only       # Build only, no deploy
+        $0 deploy --no-upstream      # Deploy current custom WITHOUT update
   check [main|dev]
       Check repository status, compare with upstream.
       Example: $0 check dev
